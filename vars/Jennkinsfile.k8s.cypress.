@@ -1,0 +1,130 @@
+stage ('build appbuilder images') {
+          agent {
+            label 'voltron'
+          }
+          environment {
+            ECR_DEPENDENCIES_TAG = sh(script: 'echo "${ECR_DOMAIN}/${ECR_REPO}:dependencies-$(md5sum Gemfile.lock yarn.lock | awk \'{print $1}\' ORS=\'-\')"', returnStdout: true).trim()
+          }
+          steps {
+            withDockerRegistry([ credentialsId: "${ECR_CREDS}", url: "${ECR_URL}" ]) {
+              sh label: 'pull docker test image', script: 'docker pull ${ECR_TEST_TAG_BRANCH} || echo "No cache for ${ECR_TEST_TAG_BRANCH}"'
+              sh label: 'pull docker dependencies image', script: 'docker pull ${ECR_DEPENDENCIES_TAG} || echo "No cache for ${ECR_DEPENDENCIES_TAG}"'
+              sh label: "Check local log directory", script: "ls -lahrt log"
+              sh label: 'build docker ci image', script: 'docker build --cache-from ${ECR_DEPENDENCIES_TAG} --cache-from ${ECR_TEST_TAG_BRANCH} --build-arg BUILDKIT_INLINE_CACHE=1 -f .docker/Dockerfile --build-arg RAILS_ENV_ARG=${ENV_TAG} -t ${ECR_TEST_TAG_BRANCH} -t ${ECR_TEST_TAG} -t ${ECR_TEST_TAG_SHA} --pull=true .'
+              // sh label: 'build docker test image', script: 'docker build --cache-from ${ECR_DEPENDENCIES_TAG} --cache-from ${ECR_TEST_TAG_BRANCH} --build-arg BUILDKIT_INLINE_CACHE=1 -f .docker/Dockerfile --build-arg RAILS_ENV_ARG=test -t ${ECR_TEST_TAG_BRANCH} -t ${ECR_TEST_TAG} -t ${ECR_TEST_TAG_SHA} --pull=true .'
+              sh label: 'inspect docker test image', script: 'docker inspect ${ECR_TEST_TAG}'
+              sh label: 'inspect docker logs', script: "docker run --rm ${ECR_TEST_TAG} ls -lah log"
+              sh label: 'inspect docker webpack assets', script: 'docker run --rm ${ECR_TEST_TAG} ls -lahR public'
+              sh label: 'push tags to ECR', script: '''
+                docker push ${ECR_TEST_TAG} &&
+                docker push ${ECR_TEST_TAG_SHA} &&
+                docker push ${ECR_TEST_TAG_BRANCH}
+              '''
+            }
+            sh label: 'build docker-compose for ci environments', script: '.jenkins/scripts/expand.sh < docker-compose.ci.yml > docker-compose.ci-built.yml'
+            sh label: 'inspect expanded docker-compose.ci.yml', script: 'cat docker-compose.ci-built.yml'
+            stash includes: 'docker-compose.*.yml, .env.*', name: 'docker-compose-ymls'
+          }
+        }
+      }
+    }
+    stage('run cypress tests in chrome') {
+      agent {
+        label 'voltron'
+      }
+      environment {
+        BROWSER='chrome'
+        // PROJECT_NAME = "gocanvas-appbuilder-$JOB_NAME-$BUILD_NUMBER-$EXECUTOR_NUMBER"
+        // COMPOSE_FLAGS = "-p $PROJECT_NAME -f docker-compose.ci-built.yml"
+        COMPOSE_PROJECT_NAME = "gocanvas-appbuilder-$JOB_NAME-$BUILD_NUMBER-$EXECUTOR_NUMBER"
+        COMPOSE_FILE = "docker-compose.ci-built.yml"
+      }
+      options {
+        skipDefaultCheckout()
+      }
+      steps {
+        cleanWs()
+        unstash 'docker-compose-ymls'
+        lock(resource: "${COMPOSE_PROJECT_NAME}") {
+          sh label: 'inspect expanded docker-compose.yml', script: 'cat docker-compose.ci-built.yml'
+          withDockerRegistry([ credentialsId: "${ECR_CREDS}", url: "${ECR_URL}" ]) {
+            sh label: "Pull images", script: "docker compose pull"
+          }
+          sh label: "Inspect jenkins logs dir only", script: """
+            ls -lahrt log test/ci/jest-reports test/ci/reports test/ci/teaspoon-reports || true
+          """
+          sh label: "Compose network up", script: "docker compose up --detach $CYPRESS_SERVICE_NAME"
+          sh label: "Inspect logs dir", script: """
+            docker compose run --rm $APP_SERVICE_NAME ls -lahrt log test/jest-reports test/reports spec/reports || true
+            ls -lahrt log test/jest-reports test/reports spec/reports || true
+          """
+          sh label: "Wait for mysql", script: "docker compose run --rm $APP_SERVICE_NAME .jenkins/scripts/wait-for-it.sh -t 300 mysql:3306"
+          sh label: "Load and seed mysql", script: "docker compose run --rm $APP_SERVICE_NAME bundle exec rake db:setup"
+          // sh label: "Run asset:precompile pipeline", script: "docker-compose $COMPOSE_FLAGS exec -T -u app $APP_SERVICE_NAME bundle exec rake assets:precompile"
+          sh label: "Inspect Cypress Volumes", script: """
+            docker compose run --rm $CYPRESS_SERVICE_NAME pwd || true
+            docker compose run --rm $CYPRESS_SERVICE_NAME ls -lahrtR /e2e/cypress || true
+            ls -lahrt log test/jest-reports test/reports spec/reports || true
+          """
+          sh label: "Check running compose images", script: """
+            docker compose ps || true
+          """
+          sh label: "Run cypress (Chrome)", script: """
+            timeout 720 docker compose run --entrypoint "cypress run" $CYPRESS_SERVICE_NAME --browser $BROWSER --config-file cypress-built.json
+          """
+          sh label: "Inspect Cypress logs dir", script: """
+            docker compose run --rm $CYPRESS_SERVICE_NAME ls -lahrtR /e2e/cypress || true
+          """
+          sh label: "Inspect logs dir", script: """
+            docker compose run --rm $APP_SERVICE_NAME ls -lahrt log test/jest-reports test/reports spec/reports || true
+            ls -lahrt log test/jest-reports test/reports spec/reports || true
+          """
+        }
+      }
+      post {
+        always {
+          sh label: "Inspect cypress dirs on jenkins", script: """
+            ls -lahR log e2e || true
+          """
+          sh label: "Inspect cypress volume on cypress", script: "docker compose run --rm $CYPRESS_SERVICE_NAME ls -lahR /e2e/cypress"
+          sh label: "Inspect cypress volume on appbuilder", script: "docker compose run --rm $APP_SERVICE_NAME ls -lahR /e2e/cypress"
+          sh label: "Extract logs from compose volume before archiving", script: """
+            mkdir -p log/chrome
+            mkdir -p e2e/cypress
+            docker compose cp $CYPRESS_SERVICE_NAME:/e2e/cypress e2e
+            docker compose cp --archive $APP_SERVICE_NAME:/home/app/log/. log/chrome
+            docker compose cp --archive $APP_SERVICE_NAME:/var/log/nginx/error.log log/chrome/nginx-error.log
+          """
+          sh label: "Inspect cypress dirs on jenkins", script: """
+            ls -lahR log e2e/cypress || true
+          """
+          archiveArtifacts artifacts: "log/chrome/*.log", allowEmptyArchive: true
+          // Grab cypress artifacts from docker-compose volumes
+          junit testResults: "e2e/cypress/chrome/reports/*.xml", allowEmptyResults: true
+          archiveArtifacts artifacts: "e2e/cypress/chrome/videos/**/*.*", allowEmptyArchive: true
+          archiveArtifacts artifacts: "e2e/cypress/chrome/screenshots/**/*.*", allowEmptyArchive: true
+        }
+        cleanup {
+          unstash 'docker-compose-ymls'
+          sh label: 'inspect expanded docker-compose.yml', script: 'cat docker-compose.ci-built.yml'
+          sh label: "Tear down compose", script: "docker compose down --volumes --remove-orphans"
+          cleanWs()
+        }
+      }
+    }
+  }
+  post {
+    aborted {
+      slackSend channel: "${SLACK_CHANNEL_ID}", timestamp: "${SLACK_TS}", blocks: slackBlocks(':homer:', 'Aborted')
+    }
+    unstable {
+      slackSend channel: "${SLACK_CHANNEL_ID}", timestamp: "${SLACK_TS}", blocks: slackBlocks(':seriouslywhydo:', 'Unstable')
+    }
+    failure {
+      slackSend channel: "${SLACK_CHANNEL_ID}", timestamp: "${SLACK_TS}", blocks: slackBlocks(':onfire:', 'Failed')
+    }
+    success {
+      slackSend channel: "${SLACK_CHANNEL_ID}", timestamp: "${SLACK_TS}", blocks: slackBlocks(':jenkins-party:', 'Succeeded')
+    }
+  }
+}
