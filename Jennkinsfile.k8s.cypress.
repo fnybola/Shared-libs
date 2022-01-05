@@ -1,0 +1,290 @@
+ECR_DOMAIN = "964896119444.dkr.ecr.us-east-1.amazonaws.com"
+ECR_CREDS = "ecr:us-east-1:f9f5fb7e-d48c-4a2e-94f4-1be3eaad966b"
+
+def buildEcrTagOfficialName(repo, environment) {
+  return "${ECR_DOMAIN}/${repo}:${environment}-${env.GIT_COMMIT.take(8)}"
+}
+
+def buildEcrTagGitSha(repo, environment) {
+  return "${ECR_DOMAIN}/${repo}:${environment}-${env.GIT_BRANCH.replace('/','-')}-${env.GIT_COMMIT.take(8)}"
+}
+
+def buildEcrTagBranch(repo, environment) {
+  return "${ECR_DOMAIN}/${repo}:${env.GIT_BRANCH.replace('/','-')}-${environment}"
+}
+
+DEFAULT_SLACK_CHANNEL = "#jenkins-builder"
+
+def slackBlocks(emoji, status) {
+  if (params.SLACK_THREAD == "${DEFAULT_SLACK_CHANNEL}") {
+    return slackBlocksFull(emoji, status)
+  } else {
+    return slackBlocksPartial(emoji, status)
+  }
+}
+
+def slackBlocksPartial(emoji, status) {
+  return [
+    [
+      "type": "section",
+      "text": [
+        "type": "mrkdwn",
+        "text": "*Test Status*: ${status} :cypress: ${emoji}"
+      ]
+    ],
+    [
+      "type": "section",
+      "text": [
+        "type": "mrkdwn",
+        "text": "<${env.RUN_DISPLAY_URL}|*${env.JOB_NAME}* ${env.BUILD_NUMBER}>"
+      ]
+    ]
+  ]
+}
+
+def slackBlocksFull(emoji, status) {
+  return [
+    [
+      "type": "section",
+      "text": [
+        "type": "mrkdwn",
+        "text": "*Build Status*: ${status} :cypress: ${emoji}"
+      ]
+    ],
+    [
+      "type": "section",
+      "text": [
+        "type": "mrkdwn",
+        "text": "<${env.RUN_DISPLAY_URL}|*${env.JOB_NAME}* ${env.BUILD_NUMBER}>"
+      ]
+    ],
+    [
+      "type": "context",
+      "elements": [
+        [
+          "type": "mrkdwn",
+          "text": "${BUILD_MESSAGE}"
+        ]
+      ]
+    ],
+    [
+      "type": "context",
+      "elements": [
+        [
+          "type": "mrkdwn",
+          "text": "*Commit*: ${BUILD_COMMIT}"
+        ],
+        [
+          "type": "mrkdwn",
+          "text": "*Author:* ${BUILD_USER}"
+        ]
+      ]
+    ]
+  ]
+}
+pipeline {
+  agent {
+    label 'voltron'
+  }
+  environment {
+    DOCKER_BUILDKIT=1
+    PATH = "/home/jenkins/bin:/home/jenkins/.local/bin:$PATH"
+    AWS_PROFILE = "int"
+    // BEGIN - Branch specific rules
+    ECR_REPO = "appbuilder"
+    APP_SERVICE_NAME = "appbuilder"
+    CYPRESS_SERVICE_NAME = "cypress-chrome"
+    ECR_DOMAIN = "${ECR_DOMAIN}"
+    ECR_URL = "https://${ECR_DOMAIN}"
+    ENV_TAG = "ci"
+    ECR_TEST_TAG = buildEcrTagOfficialName("$ECR_REPO", "$ENV_TAG")
+    ECR_TEST_TAG_SHA = buildEcrTagGitSha("$ECR_REPO", "$ENV_TAG")
+    ECR_TEST_TAG_BRANCH = buildEcrTagBranch("$ECR_REPO", "$ENV_TAG")
+    IMAGE_TAG = "${ECR_TEST_TAG_SHA}"
+    ECR_CYPRESS_TAG = buildEcrTagBranch("$ECR_REPO-cypress", 'ci-base')
+    ECR_CYPRESS_TAG_CHROME = buildEcrTagBranch("$ECR_REPO-cypress", 'ci-chrome')
+    ECR_CYPRESS_TAG_FIREFOX = buildEcrTagBranch("$ECR_REPO-cypress", 'ci-firefox')
+    // END - Branch specific rules
+    JOB_NAME_SLUG = "${env.JOB_NAME.replace('/','-').replace('+','-')}"
+    BUILD_ID = "$APP_SERVICE_NAME-$JOB_NAME_SLUG-$BUILD_NUMBER-$EXECUTOR_NUMBER"
+  }
+  parameters {
+    string(name: 'SLACK_THREAD', defaultValue: "${DEFAULT_SLACK_CHANNEL}", description: 'Thread to send slack messages to')
+  }
+  options {
+    gitLabConnection('Gitlab')
+    timeout(time: 1, unit: 'HOURS')
+  }
+  // https://github.com/jenkinsci/gitlab-plugin/blob/master/README.md#pipeline-jobs
+  stages {
+    stage ('notifications') {
+      agent {
+        label 'voltron'
+      }
+      steps {
+        script {
+          sh 'printenv | sort'
+          sh 'docker --version'
+          sh 'docker-compose --version'
+          sh label: 'Pull committer from git', script: 'git log --format="%an" | head -1 > commit-author.txt'
+          BUILD_USER = readFile('commit-author.txt').trim()
+          sh label: 'Pull message from git', script: 'git log --format="%s" | head -1 > commit-message.txt'
+          BUILD_MESSAGE = readFile('commit-message.txt').trim()
+          sh label: 'Pull commit hash from git', script: 'git log --format="%h" | head -1 > commit-hash.txt'
+          BUILD_COMMIT = readFile('commit-hash.txt').trim()
+          slackResponse = slackSend(channel: params.SLACK_THREAD, blocks: slackBlocks('', 'Started'))
+          SLACK_TS = slackResponse.ts
+          SLACK_CHANNEL_ID = slackResponse.channelId
+        }
+      }
+    }
+    stage ('build images') {
+      parallel {
+        stage ('build cypress image') {
+          agent {
+            label 'voltron'
+          }
+          steps {
+            withDockerRegistry([ credentialsId: "${ECR_CREDS}", url: "${ECR_URL}" ]) {
+              sh label: 'pull docker image', script: 'docker pull ${ECR_CYPRESS_TAG} || echo "No cache for ${ECR_CYPRESS_TAG}"'
+              sh label: 'build base docker image', script: 'docker build -f .docker/Dockerfile.cypress --cache-from ${ECR_CYPRESS_TAG} --target base --build-arg BUILDKIT_INLINE_CACHE=1 -t ${ECR_CYPRESS_TAG} --pull=true .'
+              sh label: 'inspect docker image', script: 'docker inspect ${ECR_CYPRESS_TAG}'
+              sh label: 'build chrome docker image', script: 'docker build -f .docker/Dockerfile.cypress --cache-from ${ECR_CYPRESS_TAG} --build-arg BROWSER_ARG=chrome --build-arg BUILDKIT_INLINE_CACHE=1 -t ${ECR_CYPRESS_TAG_CHROME} --pull=true .'
+              // sh label: 'build firefox docker image', script: 'docker build -f .docker/Dockerfile.cypress --cache-from ${ECR_CYPRESS_TAG} --build-arg BROWSER_ARG=firefox --build-arg BUILDKIT_INLINE_CACHE=1 -t ${ECR_CYPRESS_TAG_FIREFOX} --pull=true .'
+              sh label: 'push image to ECR', script: '''
+                docker push ${ECR_CYPRESS_TAG} &&
+                docker push ${ECR_CYPRESS_TAG_CHROME}
+              '''
+            }
+          }
+        }
+        stage ('build appbuilder images') {
+          agent {
+            label 'voltron'
+          }
+          environment {
+            ECR_DEPENDENCIES_TAG = sh(script: 'echo "${ECR_DOMAIN}/${ECR_REPO}:dependencies-$(md5sum Gemfile.lock yarn.lock | awk \'{print $1}\' ORS=\'-\')"', returnStdout: true).trim()
+          }
+          steps {
+            withDockerRegistry([ credentialsId: "${ECR_CREDS}", url: "${ECR_URL}" ]) {
+              sh label: 'pull docker test image', script: 'docker pull ${ECR_TEST_TAG_BRANCH} || echo "No cache for ${ECR_TEST_TAG_BRANCH}"'
+              sh label: 'pull docker dependencies image', script: 'docker pull ${ECR_DEPENDENCIES_TAG} || echo "No cache for ${ECR_DEPENDENCIES_TAG}"'
+              sh label: "Check local log directory", script: "ls -lahrt log"
+              sh label: 'build docker ci image', script: 'docker build --cache-from ${ECR_DEPENDENCIES_TAG} --cache-from ${ECR_TEST_TAG_BRANCH} --build-arg BUILDKIT_INLINE_CACHE=1 -f .docker/Dockerfile --build-arg RAILS_ENV_ARG=${ENV_TAG} -t ${ECR_TEST_TAG_BRANCH} -t ${ECR_TEST_TAG} -t ${ECR_TEST_TAG_SHA} --pull=true .'
+              // sh label: 'build docker test image', script: 'docker build --cache-from ${ECR_DEPENDENCIES_TAG} --cache-from ${ECR_TEST_TAG_BRANCH} --build-arg BUILDKIT_INLINE_CACHE=1 -f .docker/Dockerfile --build-arg RAILS_ENV_ARG=test -t ${ECR_TEST_TAG_BRANCH} -t ${ECR_TEST_TAG} -t ${ECR_TEST_TAG_SHA} --pull=true .'
+              sh label: 'inspect docker test image', script: 'docker inspect ${ECR_TEST_TAG}'
+              sh label: 'inspect docker logs', script: "docker run --rm ${ECR_TEST_TAG} ls -lah log"
+              sh label: 'inspect docker webpack assets', script: 'docker run --rm ${ECR_TEST_TAG} ls -lahR public'
+              sh label: 'push tags to ECR', script: '''
+                docker push ${ECR_TEST_TAG} &&
+                docker push ${ECR_TEST_TAG_SHA} &&
+                docker push ${ECR_TEST_TAG_BRANCH}
+              '''
+            }
+            sh label: 'build docker-compose for ci environments', script: '.jenkins/scripts/expand.sh < docker-compose.ci.yml > docker-compose.ci-built.yml'
+            sh label: 'inspect expanded docker-compose.ci.yml', script: 'cat docker-compose.ci-built.yml'
+            stash includes: 'docker-compose.*.yml, .env.*', name: 'docker-compose-ymls'
+          }
+        }
+      }
+    }
+    stage('run cypress tests in chrome') {
+      agent {
+        label 'voltron'
+      }
+      environment {
+        BROWSER='chrome'
+        // PROJECT_NAME = "gocanvas-appbuilder-$JOB_NAME-$BUILD_NUMBER-$EXECUTOR_NUMBER"
+        // COMPOSE_FLAGS = "-p $PROJECT_NAME -f docker-compose.ci-built.yml"
+        COMPOSE_PROJECT_NAME = "gocanvas-appbuilder-$JOB_NAME-$BUILD_NUMBER-$EXECUTOR_NUMBER"
+        COMPOSE_FILE = "docker-compose.ci-built.yml"
+      }
+      options {
+        skipDefaultCheckout()
+      }
+      steps {
+        cleanWs()
+        unstash 'docker-compose-ymls'
+        lock(resource: "${COMPOSE_PROJECT_NAME}") {
+          sh label: 'inspect expanded docker-compose.yml', script: 'cat docker-compose.ci-built.yml'
+          withDockerRegistry([ credentialsId: "${ECR_CREDS}", url: "${ECR_URL}" ]) {
+            sh label: "Pull images", script: "docker compose pull"
+          }
+          sh label: "Inspect jenkins logs dir only", script: """
+            ls -lahrt log test/ci/jest-reports test/ci/reports test/ci/teaspoon-reports || true
+          """
+          sh label: "Compose network up", script: "docker compose up --detach $CYPRESS_SERVICE_NAME"
+          sh label: "Inspect logs dir", script: """
+            docker compose run --rm $APP_SERVICE_NAME ls -lahrt log test/jest-reports test/reports spec/reports || true
+            ls -lahrt log test/jest-reports test/reports spec/reports || true
+          """
+          sh label: "Wait for mysql", script: "docker compose run --rm $APP_SERVICE_NAME .jenkins/scripts/wait-for-it.sh -t 300 mysql:3306"
+          sh label: "Load and seed mysql", script: "docker compose run --rm $APP_SERVICE_NAME bundle exec rake db:setup"
+          // sh label: "Run asset:precompile pipeline", script: "docker-compose $COMPOSE_FLAGS exec -T -u app $APP_SERVICE_NAME bundle exec rake assets:precompile"
+          sh label: "Inspect Cypress Volumes", script: """
+            docker compose run --rm $CYPRESS_SERVICE_NAME pwd || true
+            docker compose run --rm $CYPRESS_SERVICE_NAME ls -lahrtR /e2e/cypress || true
+            ls -lahrt log test/jest-reports test/reports spec/reports || true
+          """
+          sh label: "Check running compose images", script: """
+            docker compose ps || true
+          """
+          sh label: "Run cypress (Chrome)", script: """
+            timeout 720 docker compose run --entrypoint "cypress run" $CYPRESS_SERVICE_NAME --browser $BROWSER --config-file cypress-built.json
+          """
+          sh label: "Inspect Cypress logs dir", script: """
+            docker compose run --rm $CYPRESS_SERVICE_NAME ls -lahrtR /e2e/cypress || true
+          """
+          sh label: "Inspect logs dir", script: """
+            docker compose run --rm $APP_SERVICE_NAME ls -lahrt log test/jest-reports test/reports spec/reports || true
+            ls -lahrt log test/jest-reports test/reports spec/reports || true
+          """
+        }
+      }
+      post {
+        always {
+          sh label: "Inspect cypress dirs on jenkins", script: """
+            ls -lahR log e2e || true
+          """
+          sh label: "Inspect cypress volume on cypress", script: "docker compose run --rm $CYPRESS_SERVICE_NAME ls -lahR /e2e/cypress"
+          sh label: "Inspect cypress volume on appbuilder", script: "docker compose run --rm $APP_SERVICE_NAME ls -lahR /e2e/cypress"
+          sh label: "Extract logs from compose volume before archiving", script: """
+            mkdir -p log/chrome
+            mkdir -p e2e/cypress
+            docker compose cp $CYPRESS_SERVICE_NAME:/e2e/cypress e2e
+            docker compose cp --archive $APP_SERVICE_NAME:/home/app/log/. log/chrome
+            docker compose cp --archive $APP_SERVICE_NAME:/var/log/nginx/error.log log/chrome/nginx-error.log
+          """
+          sh label: "Inspect cypress dirs on jenkins", script: """
+            ls -lahR log e2e/cypress || true
+          """
+          archiveArtifacts artifacts: "log/chrome/*.log", allowEmptyArchive: true
+          // Grab cypress artifacts from docker-compose volumes
+          junit testResults: "e2e/cypress/chrome/reports/*.xml", allowEmptyResults: true
+          archiveArtifacts artifacts: "e2e/cypress/chrome/videos/**/*.*", allowEmptyArchive: true
+          archiveArtifacts artifacts: "e2e/cypress/chrome/screenshots/**/*.*", allowEmptyArchive: true
+        }
+        cleanup {
+          unstash 'docker-compose-ymls'
+          sh label: 'inspect expanded docker-compose.yml', script: 'cat docker-compose.ci-built.yml'
+          sh label: "Tear down compose", script: "docker compose down --volumes --remove-orphans"
+          cleanWs()
+        }
+      }
+    }
+  }
+  post {
+    aborted {
+      slackSend channel: "${SLACK_CHANNEL_ID}", timestamp: "${SLACK_TS}", blocks: slackBlocks(':homer:', 'Aborted')
+    }
+    unstable {
+      slackSend channel: "${SLACK_CHANNEL_ID}", timestamp: "${SLACK_TS}", blocks: slackBlocks(':seriouslywhydo:', 'Unstable')
+    }
+    failure {
+      slackSend channel: "${SLACK_CHANNEL_ID}", timestamp: "${SLACK_TS}", blocks: slackBlocks(':onfire:', 'Failed')
+    }
+    success {
+      slackSend channel: "${SLACK_CHANNEL_ID}", timestamp: "${SLACK_TS}", blocks: slackBlocks(':jenkins-party:', 'Succeeded')
+    }
+  }
+}
